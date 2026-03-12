@@ -50,8 +50,8 @@ class FareChecker:
         flights, fare_type = self._get_matching_flights(flight)
         logger.debug("Found %d matching flights", len(flights))
 
-        original_fare = None
-        if fare_type.startswith("WGA"):
+        original_fare = self._get_recorded_fare(flight)
+        if original_fare is None and fare_type.startswith("WGA"):
             original_fare = self._get_original_wga_fare(flight, flights)
 
         lowest_fare = self._get_lowest_fare(flight, flights, fare_type, original_fare)
@@ -185,6 +185,16 @@ class FareChecker:
 
         for fare in fares:
             if fare["_meta"]["fareProductId"] == fare_type:
+                if original_fare is not None:
+                    current_price = self._get_fare_price(fare)
+                    if current_price is not None:
+                        parsed_current_price = self._parse_amount(current_price)
+                        if parsed_current_price["currencyCode"] == original_fare["currencyCode"]:
+                            return {
+                                "amount": parsed_current_price["amount"] - original_fare["amount"],
+                                "currencyCode": parsed_current_price["currencyCode"],
+                            }
+
                 if "priceDifference" in fare:
                     return self._parse_amount(fare["priceDifference"])
 
@@ -334,6 +344,32 @@ class FareChecker:
 
         self._original_fare_cache[cache_key] = original_fare
         return original_fare
+
+    def _get_recorded_fare(self, flight: Flight) -> JSON | None:
+        matching_bound = self._get_matching_bound_info(flight)
+        if matching_bound is None:
+            return None
+
+        today = datetime.now(timezone.utc).date().isoformat()
+        for recorded_fare in getattr(self.reservation_monitor.config, "recorded_fares", []):
+            if recorded_fare["departureDate"] < today:
+                continue
+
+            if (
+                recorded_fare["confirmationNumber"] == flight.confirmation_number
+                and recorded_fare["flightNumber"] == flight.flight_number
+                and recorded_fare["departureDate"] == matching_bound["departureDate"]
+                and recorded_fare["departureTime"] == matching_bound["departureTime"]
+                and recorded_fare["departureAirportCode"]
+                == matching_bound["departureAirport"]["code"]
+                and recorded_fare["arrivalAirportCode"] == matching_bound["arrivalAirport"]["code"]
+            ):
+                return {
+                    "amount": recorded_fare["amount"],
+                    "currencyCode": recorded_fare["currencyCode"],
+                }
+
+        return None
 
     def _get_original_wga_points_fare(self, flight: Flight) -> JSON | None:
         transactions = self._get_points_transactions()

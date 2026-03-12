@@ -140,6 +140,7 @@ class TestConfig:
             {"check_fares": "invalid"},
             {"healthchecks_url": 0},
             {"notifications": "invalid"},
+            {"recorded_fares": "invalid"},
             {"retrieval_interval": "invalid"},
         ],
     )
@@ -159,7 +160,20 @@ class TestConfig:
                     {
                         "url": "test_url",
                         "level": NotificationLevel.ERROR,
+                        "payload_format": "southwestbot",
                         "24_hour_time": False,
+                    }
+                ],
+                "recorded_fares": [
+                    {
+                        "confirmationNumber": "abc123",
+                        "flightNumber": "862",
+                        "departureDate": "2026-03-27",
+                        "departureTime": "18:05",
+                        "departureAirportCode": "lax",
+                        "arrivalAirportCode": "dal",
+                        "currencyCode": "PTS",
+                        "amount": 21000,
                     }
                 ],
                 "retrieval_interval": 30,
@@ -173,6 +187,19 @@ class TestConfig:
         self._assert_notification_config_matches(
             test_config.notifications[0], "test_url", NotificationLevel.ERROR, False
         )
+        assert test_config.notifications[0].payload_format == "southwestbot"
+        assert test_config.recorded_fares == [
+            {
+                "confirmationNumber": "ABC123",
+                "flightNumber": "862",
+                "departureDate": "2026-03-27",
+                "departureTime": "18:05",
+                "departureAirportCode": "LAX",
+                "arrivalAirportCode": "DAL",
+                "currencyCode": "PTS",
+                "amount": 21000,
+            }
+        ]
         assert test_config.retrieval_interval == 30 * 60 * 60
 
     def test_parse_config_does_not_set_values_when_a_config_value_is_empty(self) -> None:

@@ -28,7 +28,11 @@ class NotificationHandler:
         self.notifications = reservation_monitor.config.notifications
 
     def send_notification(
-        self, body: str, level: NotificationLevel = None, flights: list[Flight] | None = None
+        self,
+        body: str,
+        level: NotificationLevel = None,
+        flights: list[Flight] | None = None,
+        event_type: str = "generic",
     ) -> None:
         """
         Send a notification to all configured services. The notification will only be sent if the
@@ -58,10 +62,64 @@ class NotificationHandler:
                 body, flights, notification.twenty_four_hour_time
             )
 
+            if notification.payload_format == "southwestbot":
+                self._send_structured_webhook(notification.url, formatted_body, flights, event_type)
+                continue
+
             # Send each notification separately, as each message may contain different formatted
             # flight times
             apobj = apprise.Apprise(notification.url)
             apobj.notify(title=title, body=formatted_body, body_format=apprise.NotifyFormat.TEXT)
+
+    def _send_structured_webhook(
+        self, url: str, body: str, flights: list[Flight], event_type: str
+    ) -> None:
+        webhook_url = self._get_webhook_url(url)
+        payload = {
+            "title": "Auto Southwest Check-in Script",
+            "message": body,
+            "eventType": event_type,
+            "flights": [self._build_flight_payload(flight) for flight in flights],
+        }
+        requests.post(webhook_url, json=payload, timeout=30)
+
+    def _get_webhook_url(self, notification_url: str) -> str:
+        if notification_url.startswith("jsons://"):
+            return "https://" + notification_url.removeprefix("jsons://")
+        if notification_url.startswith("json://"):
+            return "http://" + notification_url.removeprefix("json://")
+        return notification_url
+
+    def _build_flight_payload(self, flight: Flight) -> dict[str, str]:
+        bound = self._get_matching_bound_info(flight)
+        departure_date = bound["departureDate"] if bound else ""
+        departure_time = bound["departureTime"] if bound else ""
+        departure_code = bound["departureAirport"]["code"] if bound else ""
+        arrival_code = bound["arrivalAirport"]["code"] if bound else ""
+
+        return {
+            "confirmationNumber": flight.confirmation_number,
+            "flightNumber": flight.flight_number,
+            "departureDate": departure_date,
+            "departureTime": departure_time,
+            "departureAirportCode": departure_code,
+            "arrivalAirportCode": arrival_code,
+            "departureAirportName": flight.departure_airport,
+            "arrivalAirportName": flight.destination_airport,
+        }
+
+    def _get_matching_bound_info(self, flight: Flight) -> dict[str, Any] | None:
+        for bound in flight.reservation_info.get("bounds", []):
+            if self._get_bound_flight_number(bound) == flight.flight_number:
+                return bound
+        return None
+
+    def _get_bound_flight_number(self, bound: dict[str, Any]) -> str:
+        flight_number = ""
+        for flight in bound.get("flights", []):
+            flight_number += flight["number"].removeprefix("WN")
+            flight_number += "\u200b/\u200b"
+        return flight_number.rstrip("/\u200b")
 
     def _format_flight_times(
         self, body: str, flights: list[Flight], twenty_four_hr_time: bool
@@ -105,7 +163,9 @@ class NotificationHandler:
             )
 
         logger.debug("Sending new flights notification")
-        self.send_notification(flight_schedule_message, NotificationLevel.INFO, flights)
+        self.send_notification(
+            flight_schedule_message, NotificationLevel.INFO, flights, event_type="new_flights"
+        )
 
     def reaccommodated_flights(self, flights: list[Flight]) -> None:
         # Don't send notifications if no flights can be reaccommodated
@@ -124,7 +184,12 @@ class NotificationHandler:
             )
 
         logger.debug("Sending reaccommodated flights notification")
-        self.send_notification(flight_reaccommodation_message, NotificationLevel.INFO, flights)
+        self.send_notification(
+            flight_reaccommodation_message,
+            NotificationLevel.INFO,
+            flights,
+            event_type="reaccommodated_flights",
+        )
 
     def failed_reservation_retrieval(self, error: RequestError, confirmation_number: str) -> None:
         error_message = (
@@ -172,7 +237,9 @@ class NotificationHandler:
                     )
 
         logger.debug("Sending successful check-in notification...")
-        self.send_notification(success_message, NotificationLevel.CHECKIN)
+        self.send_notification(
+            success_message, NotificationLevel.CHECKIN, [flight], event_type="successful_checkin"
+        )
 
     def failed_checkin(self, error: RequestError, flight: Flight) -> None:
         error_message = (
@@ -208,7 +275,7 @@ class NotificationHandler:
             f"here: {MANAGE_RESERVATION_URL}\n"
         )
         logger.debug("Sending lower fare notification...")
-        self.send_notification(message, NotificationLevel.INFO, [flight])
+        self.send_notification(message, NotificationLevel.INFO, [flight], event_type="lower_fare")
 
     def healthchecks_success(self, data: str) -> None:
         if self.reservation_monitor.config.healthchecks_url is not None:

@@ -30,6 +30,7 @@ class Config:
         self.browser_path = None
         self.check_fares = CheckFaresOption.SAME_FLIGHT
         self.notifications = []
+        self.recorded_fares = []
         self.retrieval_interval = 24 * 60 * 60
 
         # Account and reservation-specific configs (parsed in _parse_config, but not merged into
@@ -134,6 +135,15 @@ class Config:
 
             self._create_notification_config(notifications)
 
+        if "recorded_fares" in config:
+            recorded_fares = config["recorded_fares"]
+            if not isinstance(recorded_fares, list):
+                raise ConfigError("'recorded_fares' must be a list")
+
+            self.recorded_fares = []
+            for recorded_fare in recorded_fares:
+                self.recorded_fares.append(self._parse_recorded_fare(recorded_fare))
+
         if "notification_urls" in config:
             raise ConfigError(
                 "'notification_urls' has been removed. Use 'notifications' instead.\nTo update "
@@ -147,6 +157,59 @@ class Config:
             notification_config.create(notification_json)
             self.notifications.append(notification_config)
             self._notification_urls.append(notification_config.url)
+
+    def _parse_recorded_fare(self, recorded_fare: JSON) -> JSON:
+        if not isinstance(recorded_fare, dict):
+            raise ConfigError("Each item in 'recorded_fares' must be a dictionary")
+
+        required_string_keys = [
+            "confirmationNumber",
+            "flightNumber",
+            "departureDate",
+            "departureTime",
+            "departureAirportCode",
+            "arrivalAirportCode",
+            "currencyCode",
+        ]
+        for key in required_string_keys:
+            value = recorded_fare.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"'{key}' in recorded_fares must be a non-empty string")
+
+        amount = recorded_fare.get("amount")
+        if not isinstance(amount, int):
+            raise ConfigError("'amount' in recorded_fares must be an integer")
+        if amount < 0:
+            raise ConfigError("'amount' in recorded_fares must be greater than or equal to 0")
+
+        currency_code = recorded_fare["currencyCode"]
+        if currency_code not in {"USD", "PTS"}:
+            raise ConfigError("'currencyCode' in recorded_fares must be 'USD' or 'PTS'")
+
+        parsed_record = {
+            "confirmationNumber": recorded_fare["confirmationNumber"].strip().upper(),
+            "flightNumber": recorded_fare["flightNumber"].strip(),
+            "departureDate": recorded_fare["departureDate"].strip(),
+            "departureTime": recorded_fare["departureTime"].strip(),
+            "departureAirportCode": recorded_fare["departureAirportCode"].strip().upper(),
+            "arrivalAirportCode": recorded_fare["arrivalAirportCode"].strip().upper(),
+            "currencyCode": currency_code,
+            "amount": amount,
+        }
+
+        if "source" in recorded_fare:
+            source = recorded_fare["source"]
+            if not isinstance(source, str):
+                raise ConfigError("'source' in recorded_fares must be a string")
+            parsed_record["source"] = source
+
+        if "updatedAt" in recorded_fare:
+            updated_at = recorded_fare["updatedAt"]
+            if not isinstance(updated_at, str):
+                raise ConfigError("'updatedAt' in recorded_fares must be a string")
+            parsed_record["updatedAt"] = updated_at
+
+        return parsed_record
 
 
 class GlobalConfig(Config):
@@ -387,6 +450,7 @@ class NotificationConfig(Config):
         super().__init__()
         self.url = None
         self.level = NotificationLevel.INFO
+        self.payload_format = "default"
         self.twenty_four_hour_time = False
 
     def _parse_config(self, config: JSON) -> None:
@@ -409,6 +473,12 @@ class NotificationConfig(Config):
                 self.level = NotificationLevel(level)
             except ValueError as err:
                 raise ConfigError(f"'{level}' is not a valid notification level") from err
+
+        if "payload_format" in config:
+            self.payload_format = config["payload_format"]
+
+            if self.payload_format not in {"default", "southwestbot"}:
+                raise ConfigError("'payload_format' must be 'default' or 'southwestbot'")
 
         if "24_hour_time" in config:
             self.twenty_four_hour_time = config["24_hour_time"]

@@ -30,6 +30,7 @@
                     "check_fares": { "$ref": "#/$defs/check_fares" },
                     "healthchecks_url": { "$ref": "#/$defs/healthchecks_url" },
                     "notifications": { "$ref": "#/$defs/notifications" },
+                    "recorded_fares": { "$ref": "#/$defs/recorded_fares" },
                     "retrieval_interval": { "$ref": "#/$defs/retrieval_interval" }
                 },
                 "required": ["username", "password"],
@@ -61,6 +62,7 @@
                     "check_fares": { "$ref": "#/$defs/check_fares" },
                     "healthchecks_url": { "$ref": "#/$defs/healthchecks_url" },
                     "notifications": { "$ref": "#/$defs/notifications" },
+                    "recorded_fares": { "$ref": "#/$defs/recorded_fares" },
                     "retrieval_interval": { "$ref": "#/$defs/retrieval_interval" }
                 },
                 "required": ["confirmationNumber", "firstName", "lastName"],
@@ -118,6 +120,12 @@
                         "description": "A notification URL in the Apprise format"
                     },
                     "level": { "$ref": "#/$defs/notification_level" },
+                    "payload_format": {
+                        "type": "string",
+                        "enum": ["default", "southwestbot"],
+                        "description": "Optional structured payload formatting for compatible webhook consumers.",
+                        "default": "default"
+                    },
                     "24_hour_time": {
                         "type": "boolean",
                         "description": "Display flight times in notifications and console messages in 24-hour format instead of 12-hour format.",
@@ -163,6 +171,40 @@
         "healthchecks_url": {
             "type": "string",
             "description": "Healthchecks.io URL to monitor successful and failed fare checks"
+        },
+        "recorded_fares": {
+            "type": "array",
+            "description": "Optional self-reported original purchase prices for exact flights.",
+            "default": [],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "confirmationNumber": { "type": "string", "minLength": 1 },
+                    "flightNumber": { "type": "string", "minLength": 1 },
+                    "departureDate": { "type": "string", "minLength": 1 },
+                    "departureTime": { "type": "string", "minLength": 1 },
+                    "departureAirportCode": { "type": "string", "minLength": 1 },
+                    "arrivalAirportCode": { "type": "string", "minLength": 1 },
+                    "currencyCode": {
+                        "type": "string",
+                        "enum": ["USD", "PTS"]
+                    },
+                    "amount": { "type": "integer", "minimum": 0 },
+                    "source": { "type": "string" },
+                    "updatedAt": { "type": "string" }
+                },
+                "required": [
+                    "confirmationNumber",
+                    "flightNumber",
+                    "departureDate",
+                    "departureTime",
+                    "departureAirportCode",
+                    "arrivalAirportCode",
+                    "currencyCode",
+                    "amount"
+                ],
+                "additionalProperties": false
+            }
         }
     }
 }

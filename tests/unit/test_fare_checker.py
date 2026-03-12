@@ -101,6 +101,63 @@ class TestFareChecker:
             ["fare_one"], "WGARED", {"amount": 21000, "currencyCode": "PTS"}
         )
 
+    def test_get_flight_price_prefers_recorded_fare(
+        self, mocker: MockerFixture, test_flight: Flight
+    ) -> None:
+        flights = [{"flightNumbers": "100", "fares": ["fare_one"]}]
+        mocker.patch.object(FareChecker, "_get_matching_flights", return_value=(flights, "ANY"))
+        mock_get_recorded_fare = mocker.patch.object(
+            FareChecker, "_get_recorded_fare", return_value={"amount": 179, "currencyCode": "USD"}
+        )
+        mock_get_original_wga_fare = mocker.patch.object(FareChecker, "_get_original_wga_fare")
+        mock_get_matching_fare = mocker.patch.object(
+            FareChecker, "_get_matching_fare", return_value={"amount": -20, "currencyCode": "USD"}
+        )
+
+        price = self.checker._get_flight_price(test_flight)
+
+        assert price == {"amount": -20, "currencyCode": "USD"}
+        mock_get_recorded_fare.assert_called_once_with(test_flight)
+        mock_get_original_wga_fare.assert_not_called()
+        mock_get_matching_fare.assert_called_once_with(
+            ["fare_one"], "ANY", {"amount": 179, "currencyCode": "USD"}
+        )
+
+    def test_get_matching_fare_uses_recorded_fare_against_current_price(
+        self,
+    ) -> None:
+        fares = [
+            {
+                "_meta": {"fareProductId": "ANY"},
+                "price": {"amount": "249", "currencyCode": "USD"},
+                "priceDifference": {"sign": "+", "amount": "70", "currencyCode": "USD"},
+            }
+        ]
+
+        price = self.checker._get_matching_fare(
+            fares, "ANY", {"amount": 179, "currencyCode": "USD"}
+        )
+
+        assert price == {"amount": 70, "currencyCode": "USD"}
+
+    def test_get_recorded_fare_returns_matching_record(self, test_flight: Flight) -> None:
+        self.checker.reservation_monitor.config.recorded_fares = [
+            {
+                "confirmationNumber": "",
+                "flightNumber": "100",
+                "departureDate": "2026-03-27",
+                "departureTime": "18:05",
+                "departureAirportCode": "LAX",
+                "arrivalAirportCode": "DAL",
+                "currencyCode": "PTS",
+                "amount": 21000,
+            }
+        ]
+
+        price = self.checker._get_recorded_fare(test_flight)
+
+        assert price == {"amount": 21000, "currencyCode": "PTS"}
+
     @pytest.mark.parametrize("bound", ["outbound", "inbound"])
     def test_get_matching_flights_retrieves_correct_bound_page(
         self, mocker: MockerFixture, test_flight: Flight, bound: str
