@@ -23,10 +23,24 @@ Install all the requirements needed
 pip install -r tests/requirements.txt
 ```
 
+If you prefer to keep test and lint tools isolated from your global Python install, you can use the
+repo-local virtual environment:
+```shell
+python3 -m venv .venv
+.venv/bin/pip install -r requirements.txt
+.venv/bin/pip install -r tests/requirements.txt
+.venv/bin/pip install ruff
+```
+
 ### Running the Tests
 To run all tests
 ```shell
 pytest
+```
+
+If you are using the local virtual environment, run:
+```shell
+PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 .venv/bin/pytest -p pytest_mock
 ```
 
 To run only unit tests
@@ -51,6 +65,11 @@ pytest tests/unit/test_<module1>.py tests/unit/test_<module2>.py
 To get a coverage report
 ```shell
 pytest --cov
+```
+
+To lint the Python files with the local virtual environment, run:
+```shell
+.venv/bin/ruff check .
 ```
 
 [pytest]: https://docs.pytest.org

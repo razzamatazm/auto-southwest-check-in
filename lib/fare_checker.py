@@ -32,9 +32,18 @@ class FareChecker:
         If it is, send a notification to the user about the lower fare.
         """
         logger.debug("Checking current price for flight")
-        flight_price = self._get_flight_price(flight)
+        fare_check_result = self._get_flight_price_result(flight)
+        flight_price = fare_check_result["priceDifference"]
 
         price_info = f"{flight_price['amount']:+,} {flight_price['currencyCode']}"
+        logger.info(
+            "Fare check for flight %s (%s): original=%s current=%s delta=%s",
+            flight.flight_number,
+            fare_check_result["fareType"],
+            self._format_price_for_log(fare_check_result["originalFare"]),
+            self._format_price_for_log(fare_check_result["currentFare"]),
+            price_info,
+        )
         logger.debug("Flight price change found for %s", price_info)
 
         # The Southwest website can report a fare price difference of -1 USD. This is a
@@ -62,6 +71,10 @@ class FareChecker:
 
     def _get_flight_price(self, flight: Flight) -> JSON:
         """Get the price difference of the flight"""
+        return self._get_flight_price_result(flight)["priceDifference"]
+
+    def _get_flight_price_result(self, flight: Flight) -> JSON:
+        """Get the fare type, current fare, original fare, and price difference for a flight."""
         flights, fare_type = self._get_matching_flights(flight)
         logger.debug("Found %d matching flights", len(flights))
 
@@ -69,7 +82,9 @@ class FareChecker:
         if original_fare is None and fare_type.startswith("WGA"):
             original_fare = self._get_original_wga_fare(flight, flights)
 
-        lowest_fare = self._get_lowest_fare(flight, flights, fare_type, original_fare)
+        lowest_fare = self._get_lowest_fare_result(flight, flights, fare_type, original_fare)
+        lowest_fare["fareType"] = fare_type
+        lowest_fare["originalFare"] = original_fare
         return lowest_fare
 
     def _get_matching_flights(self, flight: Flight) -> tuple[list[JSON], str]:
@@ -165,6 +180,17 @@ class FareChecker:
         fare_type: str,
         original_fare: JSON | None = None,
     ) -> JSON:
+        return self._get_lowest_fare_result(flight, flights, fare_type, original_fare)[
+            "priceDifference"
+        ]
+
+    def _get_lowest_fare_result(
+        self,
+        flight: Flight,
+        flights: list[JSON],
+        fare_type: str,
+        original_fare: JSON | None = None,
+    ) -> JSON:
         """
         Get the lowest fare for the queried flights based on the filter being used. If no fare is
         available for the specific fare type, a 0 USD difference will be returned.
@@ -174,20 +200,33 @@ class FareChecker:
         for new_flight in flights:
             # Only compare flight fares that match the current filter
             if self.filter(flight, new_flight):
-                fare = self._get_matching_fare(new_flight["fares"], fare_type, original_fare)
+                fare = self._get_matching_fare_result(new_flight["fares"], fare_type, original_fare)
                 # Check if this fare is the lowest encountered so far
-                if not lowest_fare or (fare and fare["amount"] < lowest_fare["amount"]):
+                if not lowest_fare or (
+                    fare
+                    and fare["priceDifference"]["amount"]
+                    < lowest_fare["priceDifference"]["amount"]
+                ):
                     lowest_fare = fare
 
         if not lowest_fare:
             # No fares are available (most likely due to tickets of that fare type
             # not being sold anymore). Therefore, report back a 0 USD difference.
             logger.debug("Fare %s is not available. Setting price difference to 0 USD", fare_type)
-            lowest_fare = {"amount": 0, "currencyCode": "USD"}
+            lowest_fare = {
+                "currentFare": None,
+                "priceDifference": {"amount": 0, "currencyCode": "USD"},
+            }
 
         return lowest_fare
 
     def _get_matching_fare(
+        self, fares: list[JSON], fare_type: str, original_fare: JSON | None = None
+    ) -> JSON | None:
+        fare_result = self._get_matching_fare_result(fares, fare_type, original_fare)
+        return None if fare_result is None else fare_result["priceDifference"]
+
+    def _get_matching_fare_result(
         self, fares: list[JSON], fare_type: str, original_fare: JSON | None = None
     ) -> JSON | None:
         """
@@ -200,27 +239,44 @@ class FareChecker:
 
         for fare in fares:
             if fare["_meta"]["fareProductId"] == fare_type:
+                parsed_current_price = None
+                current_price = self._get_fare_price(fare)
+                if current_price is not None:
+                    parsed_current_price = self._parse_amount(current_price)
+
                 if original_fare is not None:
-                    current_price = self._get_fare_price(fare)
-                    if current_price is not None:
-                        parsed_current_price = self._parse_amount(current_price)
-                        if parsed_current_price["currencyCode"] == original_fare["currencyCode"]:
-                            return {
+                    if (
+                        parsed_current_price is not None
+                        and parsed_current_price["currencyCode"] == original_fare["currencyCode"]
+                    ):
+                        return {
+                            "currentFare": parsed_current_price,
+                            "priceDifference": {
                                 "amount": parsed_current_price["amount"] - original_fare["amount"],
                                 "currencyCode": parsed_current_price["currencyCode"],
-                            }
+                            },
+                        }
 
                 if "priceDifference" in fare:
-                    return self._parse_amount(fare["priceDifference"])
+                    return {
+                        "currentFare": parsed_current_price,
+                        "priceDifference": self._parse_amount(fare["priceDifference"]),
+                    }
 
                 break
 
         if fare_type.startswith("WGA"):
-            return self._get_basic_fare_difference(fares, original_fare)
+            return self._get_basic_fare_result(fares, original_fare)
 
         return None
 
     def _get_basic_fare_difference(
+        self, fares: list[JSON], original_fare: JSON | None = None
+    ) -> JSON | None:
+        fare_result = self._get_basic_fare_result(fares, original_fare)
+        return None if fare_result is None else fare_result["priceDifference"]
+
+    def _get_basic_fare_result(
         self, fares: list[JSON], original_fare: JSON | None = None
     ) -> JSON | None:
         """
@@ -249,8 +305,11 @@ class FareChecker:
             return None
 
         return {
-            "amount": lowest_current_basic_fare["amount"] - original_fare["amount"],
-            "currencyCode": lowest_current_basic_fare["currencyCode"],
+            "currentFare": lowest_current_basic_fare,
+            "priceDifference": {
+                "amount": lowest_current_basic_fare["amount"] - original_fare["amount"],
+                "currencyCode": lowest_current_basic_fare["currencyCode"],
+            },
         }
 
     def _derive_original_basic_fare(self, fares: list[JSON]) -> JSON | None:
@@ -466,7 +525,10 @@ class FareChecker:
         if not matching_transactions:
             return None
 
-        return max(matching_transactions, key=lambda transaction: transaction.get("transaction_at", ""))
+        return max(
+            matching_transactions,
+            key=lambda transaction: transaction.get("transaction_at", ""),
+        )
 
     def _get_matching_bound_info(self, flight: Flight) -> JSON | None:
         for bound in flight.reservation_info["bounds"]:
@@ -559,6 +621,12 @@ class FareChecker:
         sign = price_info.get("sign", "")
         parsed_amount = int(sign + price_info["amount"].replace(",", ""))
         return {"amount": parsed_amount, "currencyCode": price_info["currencyCode"]}
+
+    def _format_price_for_log(self, price_info: JSON | None) -> str:
+        if price_info is None:
+            return "unknown"
+
+        return f"{price_info['amount']:,} {price_info['currencyCode']}"
 
 
 def get_fare_check_filter(check_fares: CheckFaresOption) -> Callable[[Flight, JSON], bool]:
