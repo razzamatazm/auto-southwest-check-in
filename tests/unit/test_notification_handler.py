@@ -3,6 +3,7 @@ import pytest
 from pytest_mock import MockerFixture
 
 from lib.config import NotificationConfig
+from lib.fare_checker import FareChecker
 from lib.notification_handler import FLIGHT_TIME_PLACEHOLDER, NotificationHandler
 from lib.utils import NotificationLevel
 
@@ -78,9 +79,24 @@ class TestNotificationHandler:
         mock_send_notification = mocker.patch.object(NotificationHandler, "send_notification")
         mock_flight = mocker.patch("lib.flight.Flight")
         mock_flight.is_international = False
+        mocker.patch.object(FareChecker, "get_original_fare", return_value=None)
 
         self.handler.new_flights([mock_flight])
         assert mock_send_notification.call_args[0][1] == NotificationLevel.INFO
+
+    def test_new_flights_includes_purchase_price_when_available(
+        self, mocker: MockerFixture
+    ) -> None:
+        mock_send_notification = mocker.patch.object(NotificationHandler, "send_notification")
+        mock_flight = mocker.patch("lib.flight.Flight")
+        mock_flight.is_international = False
+        mock_flight.departure_airport = "Los Angeles"
+        mock_flight.destination_airport = "Dallas (Love Field)"
+        mocker.patch.object(NotificationHandler, "_get_purchase_price_info", return_value="21,000 PTS")
+
+        self.handler.new_flights([mock_flight])
+
+        assert "Purchase price: 21,000 PTS" in mock_send_notification.call_args[0][0]
 
     def test_new_flights_sends_passport_information_when_flight_is_international(
         self, mocker: MockerFixture

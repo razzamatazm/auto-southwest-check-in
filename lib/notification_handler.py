@@ -151,6 +151,8 @@ class NotificationHandler:
                 f"Flight from {flight.departure_airport} to {flight.destination_airport} on "
                 f"{FLIGHT_TIME_PLACEHOLDER}\n"
             )
+            if price_info := self._get_purchase_price_info(flight):
+                flight_schedule_message += f"Purchase price: {price_info}\n"
             if flight.is_international:
                 is_international = True
 
@@ -166,6 +168,21 @@ class NotificationHandler:
         self.send_notification(
             flight_schedule_message, NotificationLevel.INFO, flights, event_type="new_flights"
         )
+
+    def _get_purchase_price_info(self, flight: Flight) -> str | None:
+        from .fare_checker import FareChecker
+
+        try:
+            fare_checker = FareChecker(self.reservation_monitor)
+            original_fare = fare_checker.get_original_fare(flight)
+        except Exception as err:
+            logger.debug("Could not determine purchase price for %s: %s", flight.flight_number, err)
+            return None
+
+        if original_fare is None:
+            return None
+
+        return f"{original_fare['amount']:,} {original_fare['currencyCode']}"
 
     def reaccommodated_flights(self, flights: list[Flight]) -> None:
         # Don't send notifications if no flights can be reaccommodated

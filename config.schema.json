@@ -31,6 +31,7 @@
                     "healthchecks_url": { "$ref": "#/$defs/healthchecks_url" },
                     "notifications": { "$ref": "#/$defs/notifications" },
                     "recorded_fares": { "$ref": "#/$defs/recorded_fares" },
+                    "tracked_flights": { "$ref": "#/$defs/tracked_flights" },
                     "retrieval_interval": { "$ref": "#/$defs/retrieval_interval" }
                 },
                 "required": ["username", "password"],
@@ -63,6 +64,7 @@
                     "healthchecks_url": { "$ref": "#/$defs/healthchecks_url" },
                     "notifications": { "$ref": "#/$defs/notifications" },
                     "recorded_fares": { "$ref": "#/$defs/recorded_fares" },
+                    "tracked_flights": { "$ref": "#/$defs/tracked_flights" },
                     "retrieval_interval": { "$ref": "#/$defs/retrieval_interval" }
                 },
                 "required": ["confirmationNumber", "firstName", "lastName"],
@@ -202,6 +204,43 @@
                     "arrivalAirportCode",
                     "currencyCode",
                     "amount"
+                ],
+                "additionalProperties": false
+            }
+        },
+        "tracked_flights": {
+            "type": "array",
+            "description": "Tracked flights with embedded purchase prices for exact flights.",
+            "default": [],
+            "items": {
+                "type": "object",
+                "properties": {
+                    "confirmationNumber": { "type": "string", "minLength": 1 },
+                    "flightNumber": { "type": "string", "minLength": 1 },
+                    "departureDate": { "type": "string", "minLength": 1 },
+                    "departureTime": { "type": "string", "minLength": 1 },
+                    "departureAirportCode": { "type": "string", "minLength": 1 },
+                    "arrivalAirportCode": { "type": "string", "minLength": 1 },
+                    "departureAirportName": { "type": "string" },
+                    "arrivalAirportName": { "type": "string" },
+                    "label": { "type": "string" },
+                    "last_seen": { "type": "string" },
+                    "prompted_for_price_at": { "type": "string" },
+                    "currencyCode": {
+                        "type": "string",
+                        "enum": ["USD", "PTS"]
+                    },
+                    "amount": { "type": "integer", "minimum": 0 },
+                    "source": { "type": "string" },
+                    "updatedAt": { "type": "string" }
+                },
+                "required": [
+                    "confirmationNumber",
+                    "flightNumber",
+                    "departureDate",
+                    "departureTime",
+                    "departureAirportCode",
+                    "arrivalAirportCode"
                 ],
                 "additionalProperties": false
             }

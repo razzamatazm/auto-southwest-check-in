@@ -45,6 +45,21 @@ class FareChecker:
             # Lower fare!
             self.reservation_monitor.notification_handler.lower_fare(flight, price_info)
 
+    def get_original_fare(self, flight: Flight) -> JSON | None:
+        """
+        Retrieve the originally paid fare when it is known. User-recorded fares take precedence.
+        For automatically derived fares, only Basic/WGA bookings currently have a reliable source.
+        """
+        original_fare = self._get_recorded_fare(flight)
+        if original_fare is not None:
+            return original_fare
+
+        flights, fare_type = self._get_matching_flights(flight)
+        if fare_type.startswith("WGA"):
+            return self._get_original_wga_fare(flight, flights)
+
+        return None
+
     def _get_flight_price(self, flight: Flight) -> JSON:
         """Get the price difference of the flight"""
         flights, fare_type = self._get_matching_flights(flight)
@@ -351,6 +366,26 @@ class FareChecker:
             return None
 
         today = datetime.now(timezone.utc).date().isoformat()
+        for tracked_flight in getattr(self.reservation_monitor.config, "tracked_flights", []):
+            if tracked_flight["departureDate"] < today:
+                continue
+            if "amount" not in tracked_flight or "currencyCode" not in tracked_flight:
+                continue
+
+            if (
+                tracked_flight["confirmationNumber"] == flight.confirmation_number
+                and tracked_flight["flightNumber"] == flight.flight_number
+                and tracked_flight["departureDate"] == matching_bound["departureDate"]
+                and tracked_flight["departureTime"] == matching_bound["departureTime"]
+                and tracked_flight["departureAirportCode"]
+                == matching_bound["departureAirport"]["code"]
+                and tracked_flight["arrivalAirportCode"] == matching_bound["arrivalAirport"]["code"]
+            ):
+                return {
+                    "amount": tracked_flight["amount"],
+                    "currencyCode": tracked_flight["currencyCode"],
+                }
+
         for recorded_fare in getattr(self.reservation_monitor.config, "recorded_fares", []):
             if recorded_fare["departureDate"] < today:
                 continue

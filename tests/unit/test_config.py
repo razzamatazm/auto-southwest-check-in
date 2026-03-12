@@ -141,6 +141,7 @@ class TestConfig:
             {"healthchecks_url": 0},
             {"notifications": "invalid"},
             {"recorded_fares": "invalid"},
+            {"tracked_flights": "invalid"},
             {"retrieval_interval": "invalid"},
         ],
     )
@@ -176,6 +177,19 @@ class TestConfig:
                         "amount": 21000,
                     }
                 ],
+                "tracked_flights": [
+                    {
+                        "confirmationNumber": "abc123",
+                        "flightNumber": "863",
+                        "departureDate": "2026-03-28",
+                        "departureTime": "08:15",
+                        "departureAirportCode": "dal",
+                        "arrivalAirportCode": "lax",
+                        "currencyCode": "USD",
+                        "amount": 179,
+                        "label": "863: DAL -> LAX on 2026-03-28",
+                    }
+                ],
                 "retrieval_interval": 30,
             }
         )
@@ -200,6 +214,19 @@ class TestConfig:
                 "amount": 21000,
             }
         ]
+        assert test_config.tracked_flights == [
+            {
+                "confirmationNumber": "ABC123",
+                "flightNumber": "863",
+                "departureDate": "2026-03-28",
+                "departureTime": "08:15",
+                "departureAirportCode": "DAL",
+                "arrivalAirportCode": "LAX",
+                "currencyCode": "USD",
+                "amount": 179,
+                "label": "863: DAL -> LAX on 2026-03-28",
+            }
+        ]
         assert test_config.retrieval_interval == 30 * 60 * 60
 
     def test_parse_config_does_not_set_values_when_a_config_value_is_empty(self) -> None:
@@ -211,7 +238,38 @@ class TestConfig:
         assert test_config.check_fares == expected_config.check_fares
         assert test_config.healthchecks_url == expected_config.healthchecks_url
         assert test_config.notifications == expected_config.notifications
+        assert test_config.tracked_flights == expected_config.tracked_flights
         assert test_config.retrieval_interval == expected_config.retrieval_interval
+
+    def test_parse_config_allows_tracked_flights_without_purchase_price(self) -> None:
+        test_config = Config()
+        test_config._parse_config(
+            {
+                "tracked_flights": [
+                    {
+                        "confirmationNumber": "abc123",
+                        "flightNumber": "862",
+                        "departureDate": "2026-03-27",
+                        "departureTime": "18:05",
+                        "departureAirportCode": "lax",
+                        "arrivalAirportCode": "dal",
+                        "label": "862: LAX -> DAL on 2026-03-27",
+                    }
+                ]
+            }
+        )
+
+        assert test_config.tracked_flights == [
+            {
+                "confirmationNumber": "ABC123",
+                "flightNumber": "862",
+                "departureDate": "2026-03-27",
+                "departureTime": "18:05",
+                "departureAirportCode": "LAX",
+                "arrivalAirportCode": "DAL",
+                "label": "862: LAX -> DAL on 2026-03-27",
+            }
+        ]
 
     def test_parse_config_sets_retrieval_interval_to_a_minimum(self) -> None:
         test_config = Config()

@@ -31,6 +31,7 @@ class Config:
         self.check_fares = CheckFaresOption.SAME_FLIGHT
         self.notifications = []
         self.recorded_fares = []
+        self.tracked_flights = []
         self.retrieval_interval = 24 * 60 * 60
 
         # Account and reservation-specific configs (parsed in _parse_config, but not merged into
@@ -144,6 +145,15 @@ class Config:
             for recorded_fare in recorded_fares:
                 self.recorded_fares.append(self._parse_recorded_fare(recorded_fare))
 
+        if "tracked_flights" in config:
+            tracked_flights = config["tracked_flights"]
+            if not isinstance(tracked_flights, list):
+                raise ConfigError("'tracked_flights' must be a list")
+
+            self.tracked_flights = []
+            for tracked_flight in tracked_flights:
+                self.tracked_flights.append(self._parse_tracked_flight(tracked_flight))
+
         if "notification_urls" in config:
             raise ConfigError(
                 "'notification_urls' has been removed. Use 'notifications' instead.\nTo update "
@@ -210,6 +220,57 @@ class Config:
             parsed_record["updatedAt"] = updated_at
 
         return parsed_record
+
+    def _parse_tracked_flight(self, tracked_flight: JSON) -> JSON:
+        if not isinstance(tracked_flight, dict):
+            raise ConfigError("Each item in 'tracked_flights' must be a dictionary")
+
+        required_string_keys = [
+            "confirmationNumber",
+            "flightNumber",
+            "departureDate",
+            "departureTime",
+            "departureAirportCode",
+            "arrivalAirportCode",
+        ]
+        parsed_flight = {}
+        for key in required_string_keys:
+            value = tracked_flight.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ConfigError(f"'{key}' in tracked_flights must be a non-empty string")
+
+            if key in {"confirmationNumber", "departureAirportCode", "arrivalAirportCode"}:
+                parsed_flight[key] = value.strip().upper()
+            else:
+                parsed_flight[key] = value.strip()
+
+        amount = tracked_flight.get("amount")
+        currency_code = tracked_flight.get("currencyCode")
+        if amount is not None or currency_code is not None:
+            if not isinstance(amount, int):
+                raise ConfigError("'amount' in tracked_flights must be an integer")
+            if amount < 0:
+                raise ConfigError("'amount' in tracked_flights must be greater than or equal to 0")
+            if currency_code not in {"USD", "PTS"}:
+                raise ConfigError("'currencyCode' in tracked_flights must be 'USD' or 'PTS'")
+            parsed_flight["amount"] = amount
+            parsed_flight["currencyCode"] = currency_code
+
+        optional_string_keys = [
+            "label",
+            "departureAirportName",
+            "arrivalAirportName",
+            "last_seen",
+            "prompted_for_price_at",
+        ]
+        for key in optional_string_keys:
+            if key in tracked_flight and tracked_flight[key] is not None:
+                value = tracked_flight[key]
+                if not isinstance(value, str):
+                    raise ConfigError(f"'{key}' in tracked_flights must be a string")
+                parsed_flight[key] = value
+
+        return parsed_flight
 
 
 class GlobalConfig(Config):

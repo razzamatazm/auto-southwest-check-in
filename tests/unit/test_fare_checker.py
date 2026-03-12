@@ -158,6 +158,25 @@ class TestFareChecker:
 
         assert price == {"amount": 21000, "currencyCode": "PTS"}
 
+    def test_get_recorded_fare_returns_matching_tracked_flight(self, test_flight: Flight) -> None:
+        self.checker.reservation_monitor.config.tracked_flights = [
+            {
+                "confirmationNumber": "",
+                "flightNumber": "100",
+                "departureDate": "2026-03-27",
+                "departureTime": "18:05",
+                "departureAirportCode": "LAX",
+                "arrivalAirportCode": "DAL",
+                "currencyCode": "USD",
+                "amount": 179,
+                "label": "100: LAX -> DAL on 2026-03-27",
+            }
+        ]
+
+        price = self.checker._get_recorded_fare(test_flight)
+
+        assert price == {"amount": 179, "currencyCode": "USD"}
+
     @pytest.mark.parametrize("bound", ["outbound", "inbound"])
     def test_get_matching_flights_retrieves_correct_bound_page(
         self, mocker: MockerFixture, test_flight: Flight, bound: str
