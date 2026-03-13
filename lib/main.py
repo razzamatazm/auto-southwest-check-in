@@ -127,8 +127,12 @@ def main(arguments: list[str], version: str) -> None:
         os.environ["TZ"] = timezone
 
     # Remove flags now that they are not needed (and will mess up parsing)
-    flags_to_remove = ["--debug-screenshots", "-v", "--verbose"]
-    arguments = [x for x in arguments if x not in flags_to_remove]
+    arguments = [
+        x
+        for x in arguments
+        if x not in ["--debug-screenshots", "--debug-fare-capture", "-v", "--verbose"]
+        and not x.startswith("--debug-fare-capture=")
+    ]
 
     try:
         set_up_check_in(arguments)

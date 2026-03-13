@@ -4,7 +4,14 @@ from datetime import datetime, timedelta, timezone
 from typing import TYPE_CHECKING, Any, Callable
 
 from .log import get_logger
-from .utils import CheckFaresOption, FlightChangeError, make_request, time
+from .utils import (
+    CheckFaresOption,
+    DriverTimeoutError,
+    FlightChangeError,
+    RequestError,
+    make_request,
+    time,
+)
 from .webdriver import WebDriver
 
 if TYPE_CHECKING:
@@ -25,6 +32,7 @@ class FareChecker:
         self.filter = get_fare_check_filter(self.reservation_monitor.config.check_fares)
         self._original_fare_cache = {}
         self._points_transactions_cache = {}
+        self._booking_search_cache = {}
 
     def check_flight_price(self, flight: Flight) -> None:
         """
@@ -37,11 +45,13 @@ class FareChecker:
 
         price_info = f"{flight_price['amount']:+,} {flight_price['currencyCode']}"
         logger.info(
-            "Fare check for flight %s (%s): original=%s current=%s delta=%s",
+            "Fare check for flight %s (%s): original=%s [%s] current=%s [%s] delta=%s",
             flight.flight_number,
             fare_check_result["fareType"],
             self._format_price_for_log(fare_check_result["originalFare"]),
+            fare_check_result.get("originalFareSource", "unknown"),
             self._format_price_for_log(fare_check_result["currentFare"]),
+            fare_check_result.get("currentFareSource", "unknown"),
             price_info,
         )
         logger.debug("Flight price change found for %s", price_info)
@@ -65,7 +75,7 @@ class FareChecker:
 
         flights, fare_type = self._get_matching_flights(flight)
         if fare_type.startswith("WGA"):
-            return self._get_original_wga_fare(flight, flights)
+            return self._get_original_wga_fare(flight, flights)["fare"]
 
         return None
 
@@ -78,14 +88,36 @@ class FareChecker:
         flights, fare_type = self._get_matching_flights(flight)
         logger.debug("Found %d matching flights", len(flights))
 
-        original_fare = self._get_recorded_fare(flight)
-        if original_fare is None and fare_type.startswith("WGA"):
-            original_fare = self._get_original_wga_fare(flight, flights)
+        original_fare_info = self._get_original_fare_info(flight, flights, fare_type)
 
-        lowest_fare = self._get_lowest_fare_result(flight, flights, fare_type, original_fare)
+        lowest_fare = self._get_booking_exact_fare_result(
+            flight, fare_type, original_fare_info["fare"]
+        )
+        if lowest_fare is None:
+            lowest_fare = self._get_captured_exact_fare_result(
+                flight, fare_type, original_fare_info["fare"]
+            )
+        if lowest_fare is None:
+            lowest_fare = self._get_lowest_fare_result(
+                flight, flights, fare_type, original_fare_info["fare"]
+            )
         lowest_fare["fareType"] = fare_type
-        lowest_fare["originalFare"] = original_fare
+        lowest_fare["originalFare"] = original_fare_info["fare"]
+        lowest_fare["originalFareSource"] = original_fare_info["source"]
+        lowest_fare["currentFareSource"] = lowest_fare.pop("source", "unknown")
         return lowest_fare
+
+    def _get_original_fare_info(self, flight: Flight, flights: list[JSON], fare_type: str) -> JSON:
+        original_fare = self._get_recorded_fare(flight)
+        if original_fare is not None:
+            return {"fare": original_fare, "source": "recorded_fare"}
+
+        if fare_type.startswith("WGA"):
+            original_wga_fare = self._get_original_wga_fare(flight, flights)
+            if original_wga_fare is not None:
+                return original_wga_fare
+
+        return {"fare": None, "source": "unknown"}
 
     def _get_matching_flights(self, flight: Flight) -> tuple[list[JSON], str]:
         """
@@ -216,9 +248,204 @@ class FareChecker:
             lowest_fare = {
                 "currentFare": None,
                 "priceDifference": {"amount": 0, "currencyCode": "USD"},
+                "source": "unavailable",
             }
 
         return lowest_fare
+
+    def _get_captured_exact_fare_result(
+        self, flight: Flight, fare_type: str, original_fare: JSON | None = None
+    ) -> JSON | None:
+        lowest_fare = None
+        for fare_capture in reversed(self.reservation_monitor.checkin_scheduler.fare_capture_data):
+            for new_flight in self._get_captured_flights(fare_capture.get("body")):
+                if not self.filter(flight, new_flight):
+                    continue
+
+                fare_result = self._get_direct_matching_fare_result(
+                    new_flight.get("fares"), fare_type, original_fare
+                )
+                if fare_result is None:
+                    continue
+
+                fare_result["source"] = "captured_exact_fare"
+                if not lowest_fare or (
+                    fare_result["priceDifference"]["amount"]
+                    < lowest_fare["priceDifference"]["amount"]
+                ):
+                    lowest_fare = fare_result
+
+        return lowest_fare
+
+    def _get_booking_exact_fare_result(
+        self, flight: Flight, fare_type: str, original_fare: JSON | None = None
+    ) -> JSON | None:
+        if fare_type.startswith("WGA"):
+            booking_flights = self._get_booking_page_flights(flight, fare_type)
+            if booking_flights is None:
+                return None
+
+            lowest_fare = None
+            for new_flight in booking_flights:
+                if not self.filter(flight, new_flight):
+                    continue
+
+                fares = new_flight.get("fares")
+                fare_result = self._get_direct_matching_fare_result(fares, fare_type, original_fare)
+                if fare_result is None and original_fare is None:
+                    current_fare = self._get_direct_matching_current_fare(fares, fare_type)
+                    if current_fare is not None:
+                        fare_result = {
+                            "currentFare": current_fare,
+                            "priceDifference": {
+                                "amount": 0,
+                                "currencyCode": current_fare["currencyCode"],
+                            },
+                            "source": "booking_page_exact_fare",
+                        }
+                if fare_result is None:
+                    continue
+
+                if original_fare is None:
+                    fare_result["priceDifference"] = {
+                        "amount": 0,
+                        "currencyCode": fare_result["currentFare"]["currencyCode"],
+                    }
+
+                fare_result["source"] = "booking_page_exact_fare"
+                if not lowest_fare or (
+                    fare_result["priceDifference"]["amount"]
+                    < lowest_fare["priceDifference"]["amount"]
+                ):
+                    lowest_fare = fare_result
+
+            return lowest_fare
+
+        return None
+
+    def _get_direct_matching_current_fare(
+        self, fares: list[JSON] | None, fare_type: str
+    ) -> JSON | None:
+        if fares is None:
+            fares = []
+
+        for fare in fares:
+            if fare["_meta"]["fareProductId"] != fare_type:
+                continue
+
+            current_price = self._get_fare_price(fare)
+            return None if current_price is None else self._parse_amount(current_price)
+
+        return None
+
+    def _get_booking_page_flights(self, flight: Flight, fare_type: str) -> list[JSON] | None:
+        matching_bound = self._get_matching_bound_info(flight)
+        if matching_bound is None:
+            return None
+
+        currency = "POINTS" if fare_type.endswith("RED") else "USD"
+        cache_key = (
+            matching_bound["departureDate"],
+            matching_bound["departureAirport"]["code"],
+            matching_bound["arrivalAirport"]["code"],
+            currency,
+        )
+        if cache_key in self._booking_search_cache:
+            return self._booking_search_cache[cache_key]
+
+        try:
+            webdriver = WebDriver(self.reservation_monitor.checkin_scheduler)
+            payload = {
+                "adultPassengersCount": "1",
+                "adultsCount": "1",
+                "departureDate": matching_bound["departureDate"],
+                "destinationAirportCode": matching_bound["arrivalAirport"]["code"],
+                "fareType": currency,
+                "lapInfantPassengersCount": "0",
+                "olderChildCount": "0",
+                "originationAirportCode": matching_bound["departureAirport"]["code"],
+                "teensCount": "0",
+                "tripType": "oneway",
+                "youngerChildCount": "0",
+            }
+            response = webdriver.get_booking_page_shopping_results(payload)
+        except (DriverTimeoutError, RequestError, Exception) as err:
+            logger.debug(
+                "Could not retrieve booking-page exact fare for %s: %s",
+                flight.flight_number,
+                err,
+            )
+            return None
+
+        booking_flights = self._normalize_booking_page_flights(
+            response.get("data", {}).get("searchResults", {})
+        )
+        self._booking_search_cache[cache_key] = booking_flights
+        return booking_flights
+
+    def _normalize_booking_page_flights(self, search_results: JSON) -> list[JSON]:
+        normalized_flights = []
+        for air_product in search_results.get("airProducts") or []:
+            for detail in air_product.get("details") or []:
+                flight_numbers = "\u200b/\u200b".join(detail.get("flightNumbers") or [])
+                fares = []
+                for fare_product_id, fare_product in (
+                    detail.get("fareProducts", {}).get("ADULT") or {}
+                ).items():
+                    fare = fare_product.get("fare", {})
+                    normalized_fare = {"_meta": {"fareProductId": fare_product_id}}
+                    if fare.get("totalFare"):
+                        normalized_fare["price"] = {
+                            "amount": fare["totalFare"]["value"],
+                            "currencyCode": self._normalize_currency_code(
+                                fare["totalFare"]["currencyCode"]
+                            ),
+                        }
+                    if fare.get("totalFareBaselineDifference"):
+                        normalized_fare["priceDifference"] = {
+                            "amount": fare["totalFareBaselineDifference"]["value"],
+                            "currencyCode": self._normalize_currency_code(
+                                fare["totalFareBaselineDifference"]["currencyCode"]
+                            ),
+                        }
+                    normalized_fare["availabilityStatus"] = fare_product.get("availabilityStatus")
+                    fares.append(normalized_fare)
+
+                normalized_flights.append(
+                    {
+                        "fares": fares,
+                        "flightNumbers": flight_numbers,
+                        "stopDescription": "Nonstop"
+                        if len(detail.get("segments") or []) == 1
+                        else f"{len(detail.get('segments') or []) - 1} Stop",
+                    }
+                )
+
+        return normalized_flights
+
+    def _normalize_currency_code(self, currency_code: str) -> str:
+        if currency_code == "POINTS":
+            return "PTS"
+
+        return currency_code
+
+    def _get_captured_flights(self, response_body: JSON | None) -> list[JSON]:
+        if response_body is None:
+            return []
+
+        captured_flights = []
+        queue = [response_body]
+        while queue:
+            current = queue.pop()
+            if isinstance(current, dict):
+                if "flightNumbers" in current and "fares" in current:
+                    captured_flights.append(current)
+
+                queue.extend(current.values())
+            elif isinstance(current, list):
+                queue.extend(current)
+
+        return captured_flights
 
     def _get_matching_fare(
         self, fares: list[JSON], fare_type: str, original_fare: JSON | None = None
@@ -234,39 +461,52 @@ class FareChecker:
         an integer, and the currency code (USD or points). If no fare exists, nothing will be
         returned.
         """
+        direct_fare_result = self._get_direct_matching_fare_result(fares, fare_type, original_fare)
+        if direct_fare_result is not None:
+            return direct_fare_result
+
+        if fare_type.startswith("WGA"):
+            return self._get_basic_fare_result(fares, original_fare)
+
+        return None
+
+    def _get_direct_matching_fare_result(
+        self, fares: list[JSON] | None, fare_type: str, original_fare: JSON | None = None
+    ) -> JSON | None:
         if fares is None:
             fares = []
 
         for fare in fares:
-            if fare["_meta"]["fareProductId"] == fare_type:
-                parsed_current_price = None
-                current_price = self._get_fare_price(fare)
-                if current_price is not None:
-                    parsed_current_price = self._parse_amount(current_price)
+            if fare["_meta"]["fareProductId"] != fare_type:
+                continue
 
-                if original_fare is not None:
-                    if (
-                        parsed_current_price is not None
-                        and parsed_current_price["currencyCode"] == original_fare["currencyCode"]
-                    ):
-                        return {
-                            "currentFare": parsed_current_price,
-                            "priceDifference": {
-                                "amount": parsed_current_price["amount"] - original_fare["amount"],
-                                "currencyCode": parsed_current_price["currencyCode"],
-                            },
-                        }
+            parsed_current_price = None
+            current_price = self._get_fare_price(fare)
+            if current_price is not None:
+                parsed_current_price = self._parse_amount(current_price)
 
-                if "priceDifference" in fare:
-                    return {
-                        "currentFare": parsed_current_price,
-                        "priceDifference": self._parse_amount(fare["priceDifference"]),
-                    }
+            if (
+                original_fare is not None
+                and parsed_current_price is not None
+                and parsed_current_price["currencyCode"] == original_fare["currencyCode"]
+            ):
+                return {
+                    "currentFare": parsed_current_price,
+                    "priceDifference": {
+                        "amount": parsed_current_price["amount"] - original_fare["amount"],
+                        "currencyCode": parsed_current_price["currencyCode"],
+                    },
+                    "source": "matching_fare_price",
+                }
 
-                break
+            if "priceDifference" in fare:
+                return {
+                    "currentFare": parsed_current_price,
+                    "priceDifference": self._parse_amount(fare["priceDifference"]),
+                    "source": "matching_fare_difference",
+                }
 
-        if fare_type.startswith("WGA"):
-            return self._get_basic_fare_result(fares, original_fare)
+            break
 
         return None
 
@@ -292,6 +532,9 @@ class FareChecker:
 
         Then compare the cheapest current Basic fare against the originally paid fare.
         """
+        if fares is None:
+            fares = []
+
         if original_fare is None:
             original_fare = self._derive_original_basic_fare(fares)
 
@@ -310,6 +553,7 @@ class FareChecker:
                 "amount": lowest_current_basic_fare["amount"] - original_fare["amount"],
                 "currencyCode": lowest_current_basic_fare["currencyCode"],
             },
+            "source": "derived_basic_fare",
         }
 
     def _derive_original_basic_fare(self, fares: list[JSON]) -> JSON | None:
@@ -391,19 +635,22 @@ class FareChecker:
 
         return lowest_current_basic_fare
 
-    def _get_original_wga_fare(self, flight: Flight, flights: list[JSON]) -> JSON | None:
+    def _get_original_wga_fare(self, flight: Flight, flights: list[JSON]) -> JSON:
         currency_code = self._get_wga_currency(flight, flights)
         if currency_code is None:
-            return None
+            return {"fare": None, "source": "unknown"}
 
         cache_key = (flight.confirmation_number, flight.flight_number, currency_code)
         if cache_key in self._original_fare_cache:
             return self._original_fare_cache[cache_key]
 
         original_fare = None
+        source = "unknown"
         if currency_code == "PTS":
             try:
                 original_fare = self._get_original_wga_points_fare(flight)
+                if original_fare is not None:
+                    source = "rapid_rewards_points"
             except (FlightChangeError, KeyError, ValueError, RuntimeError) as err:
                 logger.debug(
                     "Could not retrieve WGA points activity for %s: %s", flight.flight_number, err
@@ -411,13 +658,16 @@ class FareChecker:
         else:
             try:
                 original_fare = self._get_cancel_refund_total(flight, currency_code)
+                if original_fare is not None:
+                    source = "cancel_refund_quote"
             except (FlightChangeError, KeyError, ValueError) as err:
                 logger.debug(
                     "Could not retrieve WGA refund quote for %s: %s", flight.flight_number, err
                 )
 
-        self._original_fare_cache[cache_key] = original_fare
-        return original_fare
+        fare_info = {"fare": original_fare, "source": source}
+        self._original_fare_cache[cache_key] = fare_info
+        return fare_info
 
     def _get_recorded_fare(self, flight: Flight) -> JSON | None:
         matching_bound = self._get_matching_bound_info(flight)

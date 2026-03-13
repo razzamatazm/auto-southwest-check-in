@@ -14,6 +14,7 @@ Log into your account:
 
 Options:
     --test-notifications   Test the notification URLs configuration and exit
+    --debug-fare-capture   Capture fare-related Southwest network responses for debugging
     --debug-screenshots    Take screenshots of the browser for debugging purposes. Screenshots
                            will be stored in the 'logs/' directory
     -v, --verbose          Display debug messages

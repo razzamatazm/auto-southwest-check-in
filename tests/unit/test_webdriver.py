@@ -5,10 +5,13 @@ from unittest import mock
 import pytest
 from pytest_mock import MockerFixture
 
-from lib.utils import DriverTimeoutError, LoginError
+from lib.utils import DriverTimeoutError, LoginError, RequestError
 from lib.webdriver import (
+    BOOKING_HEADERS_CAPTURE_URL,
+    BOOKING_PAGE_SHOPPING_URL,
     INVALID_CREDENTIALS_CODE,
     MOBILE_HEADERS_URL,
+    POINTS_TRANSACTIONS_URL,
     RAPID_REWARDS_URL,
     SUCCESSFUL_LOGIN_URL,
     TRIPS_URL,
@@ -31,6 +34,8 @@ class TestWebDriver:
     def _set_up_webdriver(self, mocker: MockerFixture) -> None:
         mock_checkin_scheduler = mocker.patch("lib.checkin_scheduler.CheckInScheduler")
         mock_checkin_scheduler.headers = {}
+        mock_checkin_scheduler.booking_headers = {}
+        mock_checkin_scheduler.fare_capture_data = []
         self.driver = WebDriver(mock_checkin_scheduler)
 
     @pytest.mark.parametrize(
@@ -41,6 +46,18 @@ class TestWebDriver:
     ) -> None:
         sys.argv = ["", arg]
         assert self.driver._should_take_screenshots() == take_screenshots
+
+    @pytest.mark.parametrize(
+        ("arg", "scope"),
+        [
+            ("--debug-fare-capture", "*"),
+            ("--debug-fare-capture=abc123", "ABC123"),
+            ("--no-fare-capture", None),
+        ],
+    )
+    def test_get_debug_fare_capture_scope_detects_flag(self, arg: str, scope: object) -> None:
+        sys.argv = ["", arg]
+        assert self.driver._get_debug_fare_capture_scope() == scope
 
     def test_take_debug_screenshot_takes_shot_in_debug_mode(self, mock_chrome: mock.Mock) -> None:
         self.driver.debug_screenshots = True
@@ -104,6 +121,24 @@ class TestWebDriver:
         mock_chrome.get.assert_called_once_with(RAPID_REWARDS_URL)
         mock_chrome.quit.assert_called_once()
 
+    def test_get_booking_page_shopping_results_fetches_in_browser_session(
+        self, mocker: MockerFixture, mock_chrome: mock.Mock
+    ) -> None:
+        mock_payload = {"departureDate": "2026-03-27"}
+        self.driver.checkin_scheduler.booking_headers = {"X-API-Key": "api-key"}
+        mocker.patch.object(WebDriver, "_get_booking_driver", return_value=mock_chrome)
+        mock_wait_for_attribute = mocker.patch.object(self.driver, "_wait_for_attribute")
+        mock_fetch_booking_page_shopping = mocker.patch.object(
+            WebDriver, "_fetch_booking_page_shopping", return_value={"data": {"searchResults": {}}}
+        )
+
+        response = self.driver.get_booking_page_shopping_results(mock_payload)
+
+        assert response == {"data": {"searchResults": {}}}
+        mock_wait_for_attribute.assert_called_once_with(mock_chrome, "booking_headers_set")
+        mock_fetch_booking_page_shopping.assert_called_once_with(mock_chrome, mock_payload)
+        mock_chrome.quit.assert_called_once()
+
     def test_get_driver_returns_a_webdriver_with_one_request(self, mock_chrome: mock.Mock) -> None:
         driver = self.driver._get_driver()
         driver.add_cdp_listener.assert_called_once()
@@ -144,6 +179,35 @@ class TestWebDriver:
         assert not self.driver.headers_set
         assert self.driver.checkin_scheduler.headers == {}
 
+    def test_booking_headers_listener_sets_booking_headers(self) -> None:
+        data = {
+            "params": {
+                "request": {
+                    "url": BOOKING_HEADERS_CAPTURE_URL,
+                    "headers": {
+                        "X-API-Key": "api-key",
+                        "X-App-Id": "air-booking-v2",
+                        "X-App-Version": "9.0.0",
+                        "X-Channel-Id": "southwest",
+                        "X-Diagnostic": '{"spa":"9.0.0"}',
+                        "X-User-Experience-Id": "test-id",
+                    },
+                }
+            }
+        }
+
+        self.driver._booking_headers_listener(data)
+
+        assert self.driver.booking_headers_set
+        assert self.driver.checkin_scheduler.booking_headers == {
+            "X-API-Key": "api-key",
+            "X-App-Id": "air-booking-v2",
+            "X-App-Version": "9.0.0",
+            "X-Channel-Id": "southwest",
+            "X-Diagnostic": '{"spa":"9.0.0"}',
+            "X-User-Experience-Id": "test-id",
+        }
+
     def test_login_listener_sets_login_information(self) -> None:
         data = {
             "params": {
@@ -162,6 +226,21 @@ class TestWebDriver:
 
         assert self.driver.trips_request_id == "test_id"
 
+    def test_login_listener_sets_points_transactions_information(self) -> None:
+        data = {
+            "params": {
+                "response": {
+                    "url": POINTS_TRANSACTIONS_URL
+                    + "?start_at=2025-03-12&end_at=2026-03-12"
+                },
+                "requestId": "points_id",
+            }
+        }
+
+        self.driver._login_listener(data)
+
+        assert self.driver.points_transactions_request_id == "points_id"
+
     def test_login_listener_sets_no_information_when_wrong_url(self) -> None:
         data = {"params": {"response": {"url": "fake_url"}}}
         self.driver._login_listener(data)
@@ -169,6 +248,56 @@ class TestWebDriver:
         assert self.driver.login_status_code is None
         assert self.driver.login_request_id is None
         assert self.driver.trips_request_id is None
+
+    def test_fare_capture_listener_tracks_relevant_requests(self) -> None:
+        self.driver.debug_fare_capture_scope = "*"
+        data = {
+            "params": {
+                "response": {
+                    "url": "https://www.southwest.com/api/air-booking/v1/change",
+                    "status": 200,
+                },
+                "requestId": "fare_id",
+            }
+        }
+
+        self.driver._fare_capture_listener(data)
+
+        assert self.driver.fare_request_metadata == {
+            "fare_id": {
+                "requestId": "fare_id",
+                "status": 200,
+                "url": "https://www.southwest.com/api/air-booking/v1/change",
+            }
+        }
+
+    def test_flush_fare_capture_appends_matching_payloads(
+        self, mocker: MockerFixture, mock_chrome: mock.Mock
+    ) -> None:
+        self.driver.debug_fare_capture_scope = "*"
+        self.driver.fare_request_metadata = {
+            "fare_id": {
+                "requestId": "fare_id",
+                "status": 200,
+                "url": "https://www.southwest.com/api/air-booking/v1/change",
+            }
+        }
+        mocker.patch.object(
+            WebDriver,
+            "_get_response_body",
+            return_value={"changeShoppingPage": {"flights": {"outboundPage": {"cards": []}}}},
+        )
+
+        self.driver._flush_fare_capture(mock_chrome)
+
+        assert self.driver.checkin_scheduler.fare_capture_data == [
+            {
+                "requestId": "fare_id",
+                "status": 200,
+                "url": "https://www.southwest.com/api/air-booking/v1/change",
+                "body": {"changeShoppingPage": {"flights": {"outboundPage": {"cards": []}}}},
+            }
+        ]
 
     def test_wait_for_attribute_waits_for_attribute_to_be_set(
         self, mocker: MockerFixture, mock_chrome: mock.Mock
@@ -222,6 +351,32 @@ class TestWebDriver:
 
         mock_set_account_name.assert_called_once()
 
+    def test_fetch_booking_page_shopping_returns_json(self, mock_chrome: mock.Mock) -> None:
+        self.driver.checkin_scheduler.booking_headers = {"X-API-Key": "api-key"}
+        mock_chrome.execute_async_script.return_value = {
+            "status": 200,
+            "statusText": "OK",
+            "body": '{"data":{"searchResults":{}}}',
+        }
+
+        response = self.driver._fetch_booking_page_shopping(mock_chrome, {"fareType": "POINTS"})
+
+        assert response == {"data": {"searchResults": {}}}
+        mock_chrome.execute_async_script.assert_called_once()
+        assert mock_chrome.execute_async_script.call_args.args[1] == BOOKING_PAGE_SHOPPING_URL
+
+    def test_fetch_booking_page_shopping_raises_on_failed_response(
+        self, mock_chrome: mock.Mock
+    ) -> None:
+        mock_chrome.execute_async_script.return_value = {
+            "status": 403,
+            "statusText": "Forbidden",
+            "body": '{"code":"ACCESS_DENIED"}',
+        }
+
+        with pytest.raises(RequestError, match="Forbidden"):
+            self.driver._fetch_booking_page_shopping(mock_chrome, {"fareType": "POINTS"})
+
     def test_click_login_button_does_not_click_when_form_submits(
         self, mocker: MockerFixture, mock_chrome: mock.Mock
     ) -> None:
@@ -263,11 +418,33 @@ class TestWebDriver:
 
         assert self.driver._fetch_reservations(None) == ["flight1", "flight2"]
 
-    def test_fetch_points_transactions_returns_json(self, mock_chrome: mock.Mock) -> None:
-        mock_chrome.execute_async_script.return_value = {
-            "status": 200,
-            "body": '{"data": [{"id": "transaction"}]}',
-        }
+    def test_fetch_points_transactions_returns_json_from_network_response(
+        self, mocker: MockerFixture, mock_chrome: mock.Mock
+    ) -> None:
+        self.driver.points_transactions_request_id = "points_id"
+        mocker.patch.object(WebDriver, "_wait_for_attribute")
+        mocker.patch.object(
+            WebDriver, "_get_response_body", return_value={"data": [{"id": "transaction"}]}
+        )
+
+        transactions = self.driver._fetch_points_transactions(
+            mock_chrome, "2025-03-12", "2026-03-12"
+        )
+
+        assert transactions == {"data": [{"id": "transaction"}]}
+
+    def test_fetch_points_transactions_falls_back_to_script_fetch(
+        self, mocker: MockerFixture, mock_chrome: mock.Mock
+    ) -> None:
+        mocker.patch.object(WebDriver, "_wait_for_attribute", side_effect=DriverTimeoutError(""))
+        mock_chrome.execute_async_script.side_effect = [
+            None,
+            {
+                "status": 200,
+                "contentType": "application/json",
+                "body": '{"data": [{"id": "transaction"}]}',
+            },
+        ]
 
         transactions = self.driver._fetch_points_transactions(
             mock_chrome, "2025-03-12", "2026-03-12"

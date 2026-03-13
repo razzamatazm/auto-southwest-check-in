@@ -13,7 +13,7 @@ from seleniumbase.fixtures import page_actions as seleniumbase_actions
 
 from .config import IS_DOCKER
 from .log import LOGS_DIRECTORY, get_logger
-from .utils import DriverTimeoutError, LoginError, random_sleep_duration
+from .utils import DriverTimeoutError, LoginError, RequestError, random_sleep_duration
 
 if TYPE_CHECKING:
     from .checkin_scheduler import CheckInScheduler
@@ -22,6 +22,10 @@ if TYPE_CHECKING:
 # URLs for the normal website
 BASE_URL = "https://www.southwest.com"
 ACCOUNT_URL = BASE_URL + "/loyalty/myaccount"
+BOOKING_PAGE_URL = BASE_URL + "/air/booking/"
+BOOKING_HEADERS_CAPTURE_URL = (
+    BASE_URL + "/api/content-delivery/v1/content-delivery/query/placements"
+)
 RAPID_REWARDS_URL = ACCOUNT_URL + "/rapid-rewards"
 SUCCESSFUL_LOGIN_URL = BASE_URL + "/api/security/v4/security/token"
 TRIPS_URL = (
@@ -32,6 +36,7 @@ POINTS_TRANSACTIONS_URL = (
     BASE_URL
     + "/api/loyalty-management/v2/loyalty-management/accounts/self/points-transactions-secure"
 )
+BOOKING_PAGE_SHOPPING_URL = BASE_URL + "/api/air-booking/v1/air-booking/page/air/booking/shopping"
 
 # URLs for the mobile website
 MOBILE_BASE_URL = "https://mobile.southwest.com"
@@ -49,6 +54,10 @@ WAIT_TIMEOUT_SECS = 180
 JSON = dict[str, Any]
 
 logger = get_logger(__name__)
+
+FARE_CAPTURE_URL_PATTERN = re.compile(
+    r"southwest\.com/.+(change|shopping|fare|price|cancel|refund)", re.IGNORECASE
+)
 
 
 class WebDriver:
@@ -77,6 +86,11 @@ class WebDriver:
         self.login_request_id = None
         self.login_status_code = None
         self.trips_request_id = None
+        self.points_transactions_request_id = None
+        self.booking_headers_set = False
+        self.debug_fare_capture_scope = self._get_debug_fare_capture_scope()
+        self.fare_request_metadata = {}
+        self.fare_capture_data = []
 
     def _should_take_screenshots(self) -> bool:
         """
@@ -90,6 +104,18 @@ class WebDriver:
             return True
 
         return False
+
+    def _get_debug_fare_capture_scope(self) -> str | None:
+        for argument in sys.argv[1:]:
+            if argument == "--debug-fare-capture":
+                return "*"
+            if argument.startswith("--debug-fare-capture="):
+                _, confirmation_number = argument.split("=", maxsplit=1)
+                confirmation_number = confirmation_number.strip().upper()
+                if confirmation_number:
+                    return confirmation_number
+
+        return None
 
     def _take_debug_screenshot(self, driver: Driver, name: str) -> None:
         """Take a screenshot of the browser and save the image as 'name' in LOGS_DIRECTORY"""
@@ -107,6 +133,7 @@ class WebDriver:
         # Once this attribute is set, the headers have been set in the checkin_scheduler
         self._wait_for_attribute(driver, "headers_set")
         self._take_debug_screenshot(driver, "post_headers.png")
+        self._flush_fare_capture(driver)
 
         self._quit_driver(driver)
 
@@ -142,6 +169,7 @@ class WebDriver:
         # The upcoming trips page is also loaded when we log in, so we might as well grab it
         # instead of requesting again later
         reservations = self._fetch_reservations(driver)
+        self._flush_fare_capture(driver)
 
         self._quit_driver(driver)
         return reservations
@@ -170,18 +198,59 @@ class WebDriver:
         self._take_debug_screenshot(driver, "post_points_login.png")
 
         transactions = self._fetch_points_transactions(driver, start_at, end_at)
+        self._flush_fare_capture(driver)
         self._quit_driver(driver)
         return transactions
 
+    def get_booking_headers(self) -> JSON:
+        if self.checkin_scheduler.booking_headers:
+            return self.checkin_scheduler.booking_headers
+
+        driver = self._get_booking_driver()
+        logger.debug("Waiting for booking headers")
+        self._wait_for_attribute(driver, "booking_headers_set")
+        self._quit_driver(driver)
+        return self.checkin_scheduler.booking_headers
+
+    def get_booking_page_shopping_results(self, payload: JSON) -> JSON:
+        driver = self._get_booking_driver()
+
+        try:
+            logger.debug("Waiting for booking headers")
+            self._wait_for_attribute(driver, "booking_headers_set")
+            response = self._fetch_booking_page_shopping(driver, payload)
+        finally:
+            self._quit_driver(driver)
+
+        return response
+
     def _get_driver(self) -> Driver:
+        driver = self._create_driver()
+        driver.add_cdp_listener("Network.requestWillBeSent", self._headers_listener)
+        if self.debug_fare_capture_scope is not None:
+            driver.add_cdp_listener("Network.responseReceived", self._fare_capture_listener)
+
+        # Load the login page to get valid headers
+        logger.debug("Loading mobile Southwest login page (this may take a moment)")
+        driver.get(MOBILE_LOGIN_URL)
+        self._take_debug_screenshot(driver, "after_page_load.png")
+
+        return driver
+
+    def _get_booking_driver(self) -> Driver:
+        driver = self._create_driver()
+        driver.add_cdp_listener("Network.requestWillBeSent", self._booking_headers_listener)
+        logger.debug("Loading Southwest booking page (this may take a moment)")
+        driver.get(BOOKING_PAGE_URL)
+        return driver
+
+    def _create_driver(self) -> Driver:
         logger.debug("Starting webdriver for current session")
         browser_path = self.checkin_scheduler.reservation_monitor.config.browser_path
 
         driver_version = "mlatest"
         if IS_DOCKER:
             self._start_display()
-            # Make sure a new driver is not downloaded as the Docker image
-            # already has the correct driver
             driver_version = "keep"
 
         driver = Driver(
@@ -194,14 +263,6 @@ class WebDriver:
             incognito=True,
         )
         logger.debug("Using browser version: %s", driver.caps["browserVersion"])
-
-        driver.add_cdp_listener("Network.requestWillBeSent", self._headers_listener)
-
-        # Load the login page to get valid headers
-        logger.debug("Loading mobile Southwest login page (this may take a moment)")
-        driver.get(MOBILE_LOGIN_URL)
-        self._take_debug_screenshot(driver, "after_page_load.png")
-
         return driver
 
     def _headers_listener(self, data: JSON) -> None:
@@ -213,6 +274,16 @@ class WebDriver:
         if request["url"] == MOBILE_HEADERS_URL:
             self.checkin_scheduler.headers = self._get_needed_headers(request["headers"])
             self.headers_set = True
+
+    def _booking_headers_listener(self, data: JSON) -> None:
+        request = data["params"]["request"]
+        if request["url"] != BOOKING_HEADERS_CAPTURE_URL:
+            return
+
+        booking_headers = self._get_booking_headers_from_request(request["headers"])
+        if booking_headers:
+            self.checkin_scheduler.booking_headers = booking_headers
+            self.booking_headers_set = True
 
     def _login_listener(self, data: JSON) -> None:
         """
@@ -227,6 +298,69 @@ class WebDriver:
         elif response["url"] == TRIPS_URL:
             logger.debug("Upcoming trips response has been received")
             self.trips_request_id = data["params"]["requestId"]
+        elif response["url"].startswith(POINTS_TRANSACTIONS_URL):
+            logger.debug("Rapid Rewards points activity response has been received")
+            self.points_transactions_request_id = data["params"]["requestId"]
+
+    def _fare_capture_listener(self, data: JSON) -> None:
+        if self.debug_fare_capture_scope is None:
+            return
+
+        response = data["params"]["response"]
+        url = response.get("url", "")
+        if not self._is_relevant_fare_capture_url(url):
+            return
+
+        self.fare_request_metadata[data["params"]["requestId"]] = {
+            "requestId": data["params"]["requestId"],
+            "status": response.get("status"),
+            "url": url,
+        }
+
+    def _is_relevant_fare_capture_url(self, url: str) -> bool:
+        return bool(FARE_CAPTURE_URL_PATTERN.search(url))
+
+    def _flush_fare_capture(self, driver: Driver) -> None:
+        if self.debug_fare_capture_scope is None:
+            return
+
+        scheduler_capture = self.checkin_scheduler.fare_capture_data
+        for request_id, metadata in self.fare_request_metadata.items():
+            if any(capture["requestId"] == request_id for capture in scheduler_capture):
+                continue
+
+            try:
+                response_body = self._get_response_body(driver, request_id)
+            except Exception as err:
+                logger.debug("Failed to read fare capture body for %s: %s", request_id, err)
+                continue
+
+            if not self._response_looks_like_fare_payload(response_body):
+                continue
+
+            capture = {
+                "requestId": request_id,
+                "status": metadata["status"],
+                "url": metadata["url"],
+                "body": response_body,
+            }
+            scheduler_capture.append(capture)
+            self.fare_capture_data.append(capture)
+            logger.info(
+                "Captured fare response from %s (status=%s)", metadata["url"], metadata["status"]
+            )
+
+    def _response_looks_like_fare_payload(self, response_body: JSON) -> bool:
+        response_text = json.dumps(response_body)
+        return any(
+            marker in response_text
+            for marker in [
+                "changeShoppingPage",
+                "cancelRefundQuotePage",
+                "fareProductId",
+                "priceDifference",
+            ]
+        )
 
     def _wait_for_attribute(self, driver: Driver, attribute: str) -> None:
         logger.debug("Waiting for %s to be set (timeout: %d seconds)", attribute, WAIT_TIMEOUT_SECS)
@@ -292,10 +426,11 @@ class WebDriver:
 
     def _fetch_points_transactions(self, driver: Driver, start_at: str, end_at: str) -> JSON:
         logger.debug("Retrieving Rapid Rewards points activity from %s to %s", start_at, end_at)
-        response = driver.execute_async_script(
+        driver.execute_async_script(
             """
             const [baseUrl, startAt, endAt, done] = arguments;
-            const url = `${baseUrl}?start_at=${encodeURIComponent(startAt)}&end_at=${encodeURIComponent(endAt)}`;
+            const url = `${baseUrl}?start_at=${encodeURIComponent(startAt)}`
+              + `&end_at=${encodeURIComponent(endAt)}`;
 
             fetch(url, { credentials: "include" })
               .then(async response => {
@@ -309,10 +444,101 @@ class WebDriver:
             end_at,
         )
 
+        try:
+            self._wait_for_attribute(driver, "points_transactions_request_id")
+            return self._get_response_body(driver, self.points_transactions_request_id)
+        except DriverTimeoutError:
+            logger.debug(
+                "Timed out waiting for points activity network response. "
+                "Falling back to script fetch"
+            )
+
+        response = driver.execute_async_script(
+            """
+            const [baseUrl, startAt, endAt, done] = arguments;
+            const url = `${baseUrl}?start_at=${encodeURIComponent(startAt)}`
+              + `&end_at=${encodeURIComponent(endAt)}`;
+
+            fetch(url, { credentials: "include", headers: { "accept": "application/json" } })
+              .then(async response => {
+                const text = await response.text();
+                done({
+                  status: response.status,
+                  body: text,
+                  contentType: response.headers.get("content-type") || "",
+                });
+              })
+              .catch(error => done({ error: String(error) }));
+            """,
+            POINTS_TRANSACTIONS_URL,
+            start_at,
+            end_at,
+        )
+
         if response.get("error"):
             raise RuntimeError(f"Failed to retrieve points activity: {response['error']}")
 
-        return json.loads(response["body"])
+        body = response.get("body", "")
+        if not body.strip():
+            raise RuntimeError("Rapid Rewards points activity returned an empty response body")
+
+        try:
+            return json.loads(body)
+        except json.JSONDecodeError as err:
+            logger.debug(
+                "Failed to parse points activity JSON. status=%s content_type=%s body_prefix=%r",
+                response.get("status"),
+                response.get("contentType", ""),
+                body[:200],
+            )
+            raise RuntimeError("Rapid Rewards points activity did not return JSON") from err
+
+    def _fetch_booking_page_shopping(self, driver: Driver, payload: JSON) -> JSON:
+        logger.debug("Fetching booking-page shopping results in browser session")
+        response = driver.execute_async_script(
+            """
+            const [url, headers, payload, done] = arguments;
+
+            fetch(url, {
+              method: "POST",
+              credentials: "include",
+              headers,
+              body: JSON.stringify(payload),
+            })
+              .then(async response => {
+                const text = await response.text();
+                done({
+                  ok: response.ok,
+                  status: response.status,
+                  statusText: response.statusText,
+                  body: text,
+                });
+              })
+              .catch(error => done({ error: String(error) }));
+            """,
+            BOOKING_PAGE_SHOPPING_URL,
+            {
+                "accept": "application/json, text/plain, */*",
+                "content-type": "application/json",
+                **self.checkin_scheduler.booking_headers,
+            },
+            payload,
+        )
+
+        if "error" in response:
+            raise RuntimeError(response["error"])
+
+        if response["status"] != 200:
+            raise RequestError(
+                f"{response.get('statusText', 'Request failed')} ({response['status']})",
+                response.get("body", ""),
+            )
+
+        try:
+            return json.loads(response["body"])
+        except json.decoder.JSONDecodeError as err:
+            logger.debug("Booking-page shopping returned invalid JSON: %s", response["body"])
+            raise RuntimeError("Booking-page shopping did not return JSON") from err
 
     def _get_response_body(self, driver: Driver, request_id: str) -> JSON:
         response = driver.execute_cdp_cmd("Network.getResponseBody", {"requestId": request_id})
@@ -335,6 +561,23 @@ class WebDriver:
                 headers[header] = request_headers[header]
 
         return headers
+
+    def _get_booking_headers_from_request(self, request_headers: JSON) -> JSON:
+        needed_headers = {}
+        expected_headers = [
+            "x-api-key",
+            "x-app-id",
+            "x-app-version",
+            "x-channel-id",
+            "x-diagnostic",
+            "x-user-experience-id",
+        ]
+        for header in expected_headers:
+            for request_header, value in request_headers.items():
+                if request_header.lower() == header:
+                    needed_headers[request_header] = value
+
+        return needed_headers
 
     def _set_account_name(self, account_monitor: AccountMonitor, response: JSON) -> None:
         if account_monitor.first_name:

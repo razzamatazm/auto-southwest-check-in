@@ -27,8 +27,10 @@ class CheckInScheduler:
         self.notification_handler = reservation_monitor.notification_handler
 
         self.headers = {}
+        self.booking_headers = {}
         self.flights = []
         self.checkin_handlers = []
+        self.fare_capture_data = []
 
     def process_reservations(self, confirmation_numbers: list[str]) -> None:
         """

@@ -126,11 +126,11 @@ def test_main_sets_up_the_script(mocker: MockerFixture) -> None:
     mock_set_up_check_in = mocker.patch("lib.main.set_up_check_in")
     mock_get_timezone = mocker.patch("lib.main.get_timezone")
 
-    arguments = ["test", "arguments", "--verbose", "-v"]
+    arguments = ["test", "arguments", "--verbose", "-v", "--debug-fare-capture=ABC123"]
     main.main(arguments, "test_version")
     mock_init_main_logging.assert_called_once()
 
-    # Ensure the '--verbose' and '-v' flags are removed
+    # Ensure the debug/verbose flags are removed
     mock_set_up_check_in.assert_called_once_with(arguments[:2])
 
     mock_get_timezone.assert_not_called()

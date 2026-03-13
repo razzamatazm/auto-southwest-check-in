@@ -17,6 +17,7 @@ from .log import get_logger
 JSON = dict[str, Any]
 
 BASE_URL = "https://mobile.southwest.com/api/"
+BOOKING_BASE_URL = "https://www.southwest.com"
 NTP_SERVER = "time.nist.gov"
 NTP_BACKUP_SERVER = "time.cloudflare.com"
 
@@ -43,6 +44,32 @@ def make_request(
     # Ensure the URL is not malformed
     site = site.replace("//", "/").lstrip("/")
     url = BASE_URL + site
+    return make_full_request(method, url, headers, info, max_attempts, random_sleep)
+
+
+def make_full_request(
+    method: str,
+    url: str,
+    headers: JSON,
+    info: JSON,
+    max_attempts: int = 20,
+    random_sleep: bool = True,
+) -> JSON:
+    """
+    Makes a request to a fully-qualified Southwest URL. Used for booking flows on www.southwest.com
+    that require different hosts than the mobile API.
+    """
+    return _make_request_with_retries(method, url, headers, info, max_attempts, random_sleep)
+
+
+def _make_request_with_retries(
+    method: str,
+    url: str,
+    headers: JSON,
+    info: JSON,
+    max_attempts: int,
+    random_sleep: bool,
+) -> JSON:
 
     attempts = 0
     while attempts < max_attempts:
